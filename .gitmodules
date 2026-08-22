@@ -1,0 +1,7 @@
+[submodule "kernel-adaptation-simplified"]
+	path = kernel-adaptation-simplified
+	url = https://github.com/HelloVolla/kernel-adaptation-simplified.git
+[submodule "linux"]
+	path = linux
+	url = https://gitlab.com/ubports/porting/community-ports/android12/generic/kernel-android-common.git
+	branch = android14-6.1-halium
