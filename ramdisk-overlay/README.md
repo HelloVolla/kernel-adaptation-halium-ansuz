@@ -39,3 +39,6 @@ unaffected.
       to the cmdline and then `_a`,
     - runs `dmsetup mknodes` after the dynamic partitions are mapped,
   Drop it once these land in the unified halium ramdisk.
+
+- `scripts/panic/telnet` — panic shell over NCM (the GKI kernel has no
+  RNDIS) on whichever UDC the platform registers.
