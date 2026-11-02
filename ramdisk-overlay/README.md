@@ -30,3 +30,15 @@ only), so the same overlay applies to every SD-backed Volla SFOS multiboot
 device and survives base-ramdisk bumps. A normal guest boot (valid `datapart=`
 that is not the host userdata) and a standalone boot (no `systempart=`) are
 unaffected.
+
+- `scripts/halium` — copy of the base halium script with the GKI bits ansuz
+  needs before the rootfs can be found:
+    - loads the vendor_boot modules listed in `/lib/modules/modules.load`
+      (UFS, mtu3, dm, ...), the base script never does,
+    - reads `androidboot.slot_suffix` from `/proc/bootconfig`, falling back
+      to the cmdline and then `_a`,
+    - runs `dmsetup mknodes` after the dynamic partitions are mapped,
+  Drop it once these land in the unified halium ramdisk.
+
+- `scripts/panic/telnet` — panic shell over NCM (the GKI kernel has no
+  RNDIS) on whichever UDC the platform registers.
