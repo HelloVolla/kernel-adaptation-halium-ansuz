@@ -3,6 +3,7 @@ on:
   push:
     branches:
       - main
+      - devel
 
 env:
   PACKAGE: kernel-adaptation-halium
