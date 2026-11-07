@@ -59,6 +59,7 @@
 %define deviceinfo_rootfs_image_sector_size 4096
 %define deviceinfo_halium_version 14
 %define deviceinfo_kernel_disable_modules false
+%define deviceinfo_bootimg_include_recovery true
 
 Version:        6.1.145
 Release:        1

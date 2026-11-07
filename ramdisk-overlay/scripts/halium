@@ -36,6 +36,20 @@ identify_boot_mode() {
 		androidboot.mode=*)
 			android_bootmode=${x#*=}
 			;;
+		# Android 9 system-as-root
+		skip_initramfs)
+			normal_boot="y"
+			;;
+		# Android 10+ recovery-as-boot
+		androidboot.force_normal_boot=1)
+			normal_boot="y"
+			;;
+		# Android 12+ (GKI 2.0+) recovery-as-boot
+		bootconfig)
+			if grep -q 'androidboot.force_normal_boot = "1"' /proc/bootconfig; then
+				normal_boot="y"
+			fi
+			;;
 		esac
 	done
 
@@ -55,6 +69,11 @@ identify_boot_mode() {
 		8) BOOT_MODE="android" ;; # Power off charging
 		9) BOOT_MODE="android" ;; # Low power charging
 		esac
+	fi
+
+	# System-as-root or a device without dedicated recovery partition
+	if [ -f /ramdisk-recovery.img ] && [ -z "$normal_boot" ]; then
+		BOOT_MODE="recovery"
 	fi
 
 	# On Android 8+ devices the 'android' boot mode is broken and should be avoided.
@@ -145,7 +164,7 @@ mount_android_partitions() {
 	tell_kmsg "checking fstab $fstab for additional mount points"
 
 	# On systems with A/B partition layout, current slot is provided via cmdline parameter.
-	ab_slot_suffix=$(get_slot_suffix)
+	ab_slot_suffix=$(grep -o 'androidboot\.slot_suffix=..' /proc/cmdline | tail -1 | cut -d "=" -f2)
 	[ ! -z "$ab_slot_suffix" ] && tell_kmsg "A/B slot system detected! Slot suffix is $ab_slot_suffix"
 
 	cat ${fstab} | while read line; do
@@ -252,14 +271,7 @@ resize_userdata_if_needed() {
 	path=$1
 
 	# Partition size in 1k blocks
-	case $path in
-	/dev/mmcblk*)
-		pblocks=$(grep ${path#/dev/*} /proc/partitions | awk {'print $3'})
-		;;
-	/dev/disk*)
-		pblocks=$(grep $(basename $(readlink $path)) /proc/partitions | awk {'print $3'})
-		;;
-	esac
+	pblocks=$(grep ${path##*/} /proc/partitions | awk {'print $3'})
 	# Filesystem size in 4k blocks
 	fsblocks=$(dumpe2fs -h $path | grep "Block count" | awk {'print $3'})
 	# Difference between the reported sizes in 1k blocks
@@ -409,22 +421,8 @@ mount_kernel_modules() {
 	[ -e ${rootmnt}/android/system/lib/modules ] && mount --bind ${rootmnt}/android/system/lib/modules ${rootmnt}/lib/modules
 }
 
-get_slot_suffix() {
-	# GKI bootloaders pass androidboot.* through bootconfig, older ones
-	# through the kernel cmdline
-	suffix=""
-	if [ -e /proc/bootconfig ]; then
-		suffix=$(grep -o 'androidboot\.slot_suffix = ".."' /proc/bootconfig | cut -d '"' -f2)
-	fi
-	if [ -z "$suffix" ]; then
-		suffix=$(grep -o 'androidboot\.slot_suffix=..' /proc/cmdline | tail -1 | cut -d "=" -f2)
-	fi
-	echo "$suffix"
-}
-
 load_kernel_modules() {
-	# vendor_boot ships its modules flat in /lib/modules
-	[ -f /lib/modules/modules.load ] || return
+	[ ! -d /lib/modules ] && return
 
 	kver=$(uname -r)
 	if [ ! -e "/lib/modules/${kver}" ]; then
@@ -436,34 +434,33 @@ load_kernel_modules() {
 
 	tell_kmsg "Loading kernel modules from /lib/modules/${kver}"
 
+	# Convert modules.blocklist to modprobe.d blacklist
 	mkdir -p /etc/modprobe.d
-	if [ -f "/lib/modules/${kver}/modules.blocklist" ]; then
-		sed -e 's/blocklist/blacklist/g' "/lib/modules/${kver}/modules.blocklist" >> /etc/modprobe.d/blacklist.conf
-	fi
+	cat "/lib/modules/${kver}"/modules.blocklist | sed -e 's/blocklist/blacklist/g' >> /etc/modprobe.d/blacklist.conf
 
-	# Prefer kmod to the busybox applets
+	# Prefer kmod to built-in busybox utils
 	ln -sf /bin/kmod /sbin/depmod
 	ln -sf /bin/kmod /sbin/insmod
+
+	# kmod modprobe expects modules.dep.bin, so run depmod
 	/sbin/depmod -a
 
+	# Use blacklist and enable verbose output (override the value set by /init)
 	export MODPROBE_OPTIONS="-vb"
-	while read -r line; do
-		set -- $line
-		[ -z "$1" ] || [ "$1" = "#" ] && continue
-		/sbin/modprobe "$(basename "$1" .ko)" > /dev/kmsg 2>&1
-	done < "/lib/modules/${kver}/modules.load"
 
-	tell_kmsg "Finished loading kernel modules"
+	cat "/lib/modules/${kver}/modules.load" | while read line; do
+		set -- $line
+		# Skip commented entries
+		[ "$1" = "#" ] && continue
+		modname=$(basename "$1" .ko)
+		tell_kmsg "Loading $modname"
+		/sbin/modprobe "$modname" > /dev/kmsg 2>&1
+	done
 }
 
 mountroot() {
 	# list of possible userdata partition names
 	partlist="userdata UDA DATAFS USERDATA"
-
-	# Storage and USB drivers are modules on GKI, load them before anything
-	# (including local-premount) looks for block devices
-	load_kernel_modules
-	udevadm settle
 
 	pre_mountroot
 
@@ -473,6 +470,13 @@ mountroot() {
 
 	# Put all of this script's output into /dev/kmsg
 	exec &>/dev/kmsg
+
+	load_kernel_modules
+	tell_kmsg "Finished loading kernel modules"
+	sleep 1
+
+	# busybox mdev -s
+	# udevadm trigger
 
 	# Mount root
 	#
@@ -491,7 +495,7 @@ mountroot() {
 	done
 
 	# On systems with A/B partition layout, current slot is provided via cmdline parameter.
-	ab_slot_suffix=$(get_slot_suffix)
+	ab_slot_suffix=$(grep -o 'androidboot\.slot_suffix=..' /proc/cmdline | tail -1 | cut -d "=" -f2)
 	if [ -z "$path" ] && [ ! -z "$ab_slot_suffix" ] ; then
 		tell_kmsg "Searching for A/B data partition on slot $ab_slot_suffix."
 
@@ -516,6 +520,12 @@ mountroot() {
 
 	if [ -z "$path" ]; then
 		halium_panic "Couldn't find data partition."
+	fi
+
+	# Format a wiped userdata without a filesystem header
+	if head -c 4096 $path | cmp /dev/zero 2>&1 | grep -q '^cmp: EOF on -$'; then
+		tell_kmsg "formatting wiped $path as ext4..."
+		mke2fs -t ext4 -m 0 $path || halium_panic "Failed to format wiped userdata."
 	fi
 
 	tell_kmsg "checking filesystem integrity for the userdata partition"
@@ -600,7 +610,7 @@ mountroot() {
 		# Rootfs is a directory
 		mount -o bind /tmpmnt/halium-rootfs /halium-system
 	fi
-	
+
 	# Identify image mode: either "rootfs" or "system"
 	mkdir -p /android-rootfs
 	mkdir -p /android-system
@@ -650,7 +660,24 @@ mountroot() {
 	identify_boot_mode
 
 	# Determine whether we should boot to rootfs or Android
-	if ([ -e $imagefile ] || [ -n "$_syspart" ]) && [ "$BOOT_MODE" = "android" ]; then
+	if [ "$BOOT_MODE" = "recovery" ]; then
+		tell_kmsg "Recovery boot mode for system-as-root devices"
+
+		# Clean up mounted partitions so recovery can manage them
+		umount -d /android-system /android-rootfs /halium-system /tmpmnt
+		dmsetup remove_all
+
+		mount -n -t tmpfs tmpfs ${rootmnt}
+		cd ${rootmnt}
+		if [ -d /lib/modules ]; then
+			mkdir -p lib/modules
+			mv /lib/modules/* lib/modules/
+		fi
+		cat /ramdisk-recovery.img | gzip -d | cpio -i
+		cd -
+		mkdir -p ${rootmnt}/sbin
+		ln -s ../init ${rootmnt}/sbin/init
+	elif ([ -e $imagefile ] || [ -n "$_syspart" ]) && [ "$BOOT_MODE" = "android" ]; then
 		# Bootloader says this is factory or charger mode, boot into Android.
 		tell_kmsg "Android boot mode for factory or charger mode"
 
